@@ -16,7 +16,7 @@ import sqlite_vec
 
 from app.config import (
     EMBEDDING_DIMENSIONS, EMBEDDING_MAX_TOKENS, EMBEDDING_MODEL,
-    RAG_DB, RAG_DOCUMENT_IDS, RAG_SOURCE, RAG_TOP_K, RAG_TREE, get_api_key,
+    RAG_DB, RAG_DOCUMENT_IDS, RAG_NEIGHBOR_PAGES, RAG_SOURCE, RAG_TOP_K, RAG_TREE, get_api_key,
     RAG_GRAPH, GRAPH_START_K, GRAPH_HOPS, GRAPH_MAX_RESULTS,
 )
 
@@ -124,8 +124,12 @@ def open_index(path: Path):
         db.close()
 
 
-def search(query: str) -> list[dict]:
-    """質問を埋め込み、近いページを最大RAG_TOP_K件返す。"""
+def search(query: str, neighbors: int | None = None) -> list[dict]:
+    """質問を埋め込み、近いページを最大RAG_TOP_K件返す。
+
+    neighborsが1以上なら、各ページの前後neighborsページの本文も付ける（宿題・実装）。
+    省略時は設定RAG_NEIGHBOR_PAGES（環境変数AIE_NEIGHBOR_PAGES）に従う。
+    """
     if not isinstance(query, str) or not query.strip():
         raise ValueError("検索語が空です。")
     with open_index(RAG_DB) as db:
@@ -135,7 +139,36 @@ def search(query: str) -> list[dict]:
                    vec_distance_cosine(embedding, ?) AS distance
             FROM chunks ORDER BY distance, page_id LIMIT ?
         """, (sqlite_vec.serialize_float32(vector), RAG_TOP_K))
-        return [dict(row) for row in rows]
+        hits = [dict(row) for row in rows]
+    window = RAG_NEIGHBOR_PAGES if neighbors is None else neighbors
+    return add_neighbor_pages(hits, window) if window > 0 else hits
+
+
+def add_neighbor_pages(hits: list[dict], window: int = 1, pages: list[dict] | None = None) -> list[dict]:
+    """検索結果の各ページに、同じ資料の前後windowページを付けて返す。
+
+    - 前後のページは同じdocument_idの中だけで探す（別の資料をまたがない）。
+    - 同じページは1回だけ返す。前後ページが別の検索結果でもある場合は、検索結果として扱う。
+    - 各ページにroleを付ける。"hit"は検索で見つかったページ、"neighbor"は前後として追加したページ。
+    - 並び順は検索の順位どおりで、各検索結果の中では[前, 本体, 後]とページ順に並べる。
+    """
+    if window <= 0:
+        return [{**hit, "role": "hit"} for hit in hits]
+    by_position = {(page["document_id"], page["page"]): page
+                   for page in (pages if pages is not None else load_pages(RAG_SOURCE))}
+    hit_by_id = {hit["page_id"]: hit for hit in hits}
+    results, seen = [], set()
+    for hit in hits:
+        for offset in range(-window, window + 1):
+            page = hit if offset == 0 else by_position.get((hit["document_id"], hit["page"] + offset))
+            if page is None or page["page_id"] in seen:
+                continue  # 資料の先頭・末尾を越えた場合と、すでに返したページは飛ばす
+            seen.add(page["page_id"])
+            if page["page_id"] in hit_by_id:
+                results.append({**hit_by_id[page["page_id"]], "role": "hit"})
+            else:
+                results.append({**page, "role": "neighbor", "neighbor_of": hit["page_id"]})
+    return results
 
 
 def search_graph(query: str) -> dict:
@@ -151,7 +184,7 @@ def search_graph(query: str) -> dict:
             adjacent[a].add(b)
             adjacent[b].add(a)
 
-    seeds = [hit for hit in search(query) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
+    seeds = [hit for hit in search(query, neighbors=0) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
     seed_ids = {seed["page_id"] for seed in seeds}
     results, candidates = [], {}
     for rank, seed in enumerate(seeds):
@@ -201,9 +234,12 @@ def run_full_context(agent, question: str, model, instructions: str, prompt_temp
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="エージェントを使わず、講義資料の検索だけを実行する")
     parser.add_argument("query", help="調べたい内容")
+    parser.add_argument("--neighbors", type=int, default=None,
+                        help="前後何ページの本文も付けるか（省略時は環境変数AIE_NEIGHBOR_PAGES、既定0）")
     args = parser.parse_args()
-    for i, result in enumerate(search(args.query), 1):
-        print(f"\n{'=' * 60}\n検索結果 {i}\n{'=' * 60}")
+    for i, result in enumerate(search(args.query, neighbors=args.neighbors), 1):
+        label = "検索で一致" if result.get("role", "hit") == "hit" else f"前後ページ（{result['neighbor_of']} の隣）"
+        print(f"\n{'=' * 60}\n検索結果 {i}：{label}\n{'=' * 60}")
         print(f"講義: {result['document_title']}")
         print(f"章: {result['section']}")
         print(f"タイトル: {result['title']}")
